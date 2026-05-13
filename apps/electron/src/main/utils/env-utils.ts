@@ -1,10 +1,64 @@
 import process from "node:process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { execa } from "execa";
 import stripAnsi from "strip-ansi";
-import { userInfo } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { logInfo } from "@/main/utils/logger";
 
 const DELIMITER = "_ENV_DELIMITER_";
+
+/**
+ * Common bin directories where developer tools like uvx, npx, node, bun, etc.
+ * are typically installed. macOS GUI-launched apps inherit a minimal PATH
+ * (/usr/bin:/bin:/usr/sbin:/sbin) that excludes /usr/local/bin, /opt/homebrew/bin,
+ * and user-local dirs — so when getUserShellEnv() fails or times out, the
+ * fallback process.env can't find these tools and spawn returns ENOENT.
+ * We prepend the directories that actually exist on disk to keep the augmented
+ * PATH tidy.
+ */
+function getCommonBinPaths(): string[] {
+  if (process.platform === "win32") return [];
+  const home = homedir();
+  return [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    path.join(home, ".local", "bin"),
+    path.join(home, ".cargo", "bin"),
+    path.join(home, ".bun", "bin"),
+    path.join(home, ".deno", "bin"),
+    path.join(home, ".volta", "bin"),
+    path.join(home, "Library", "pnpm"),
+  ].filter((p) => {
+    try {
+      return fs.statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  });
+}
+
+/**
+ * Return a copy of `env` with common developer bin directories prepended to PATH.
+ * Existing PATH entries are preserved (and deduplicated) so user-supplied paths
+ * still take precedence on collisions further down.
+ */
+function withAugmentedPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const extras = getCommonBinPaths();
+  if (extras.length === 0) return env;
+  const existing = (env.PATH || "").split(":").filter(Boolean);
+  const seen = new Set<string>();
+  const combined: string[] = [];
+  for (const p of [...extras, ...existing]) {
+    if (!seen.has(p)) {
+      seen.add(p);
+      combined.push(p);
+    }
+  }
+  return { ...env, PATH: combined.join(":") };
+}
 
 /**
  * Check if a command exists in the system's PATH
@@ -72,6 +126,8 @@ export async function run(cmd: string, args: string[] = [], useShell = false) {
 }
 
 // ユーザのシェルで読み込まれる環境変数を取得する非同期関数
+const SHELL_ENV_TIMEOUT_MS = 5_000;
+
 export async function getUserShellEnv() {
   // Windowsの場合、シェル初期化ファイルの問題がないのでそのまま返す
   if (process.platform === "win32") {
@@ -82,6 +138,9 @@ export async function getUserShellEnv() {
     // ログインシェル( -l ) + 対話モード( -i )を実行し、envを取得する
     // `DISABLE_AUTO_UPDATE` は oh-my-zsh の自動アップデートを防ぐための例
     const shell = detectDefaultShell();
+    // Bound the shell invocation. Slow or hanging shell init (Powerlevel10k
+    // instant prompt, oh-my-zsh auto-update, conda init with network) would
+    // otherwise stall every MCP server start indefinitely.
     const { stdout } = await execa(
       shell,
       ["-ilc", `echo -n "${DELIMITER}"; env; echo -n "${DELIMITER}"`],
@@ -89,6 +148,7 @@ export async function getUserShellEnv() {
         env: {
           DISABLE_AUTO_UPDATE: "true",
         },
+        timeout: SHELL_ENV_TIMEOUT_MS,
       },
     );
 
@@ -105,8 +165,15 @@ export async function getUserShellEnv() {
 
     return shellEnv;
   } catch (error) {
-    // シェルの起動に失敗した場合は、Electron / Node.js の既存の環境変数を返す
-    return { ...process.env };
+    // シェルの起動に失敗 / タイムアウトした場合は、Electron / Node.js の既存の環境変数を
+    // PATH 拡張付きで返す。macOS の GUI 起動アプリでは /usr/local/bin などが PATH に
+    // 含まれないため、uvx/npx/node 等の発見に失敗してしまう。
+    console.log(
+      `[env-utils] getUserShellEnv failed/timed out, augmenting process.env PATH with common bin dirs: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return withAugmentedPath({ ...process.env });
   }
 }
 

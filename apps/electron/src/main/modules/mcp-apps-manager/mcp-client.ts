@@ -131,14 +131,11 @@ export class MCPClient {
           stderr: "pipe",
         });
 
-        // Try to access the child process from the transport after connection
-        // StdioClientTransport may store it in a private property
-        await client.connect(transport);
-
         const transportAny = transport as any;
 
-        // Capture stderr via transport.stderr (PassThrough). When stderr is 'pipe', the SDK pipes
-        // child stderr to this stream; we must read from it, not from childProcess.stderr.
+        // Attach the stderr listener BEFORE connect. The SDK creates `_stderrStream`
+        // (PassThrough) in the constructor when stderr: 'pipe', so we can subscribe now
+        // and capture any startup output the child writes during the initialize handshake.
         if (transportAny.stderr) {
           transportAny.stderr.on("data", (data: Buffer | string) => {
             const content = typeof data === "string" ? data : data.toString();
@@ -146,11 +143,37 @@ export class MCPClient {
           });
         }
 
-        // Try to access child process from transport's internal properties
+        // Bound the initialize handshake. Without this, a child that spawns but never
+        // responds (crash, wrong binary, npm/npx download stalls) leaves the server
+        // status stuck on "starting" forever with no error surfaced.
+        const CONNECT_TIMEOUT_MS = 30_000;
+        try {
+          await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS });
+        } catch (connectError) {
+          const msg =
+            connectError instanceof Error
+              ? connectError.message
+              : String(connectError);
+          consoleService.addLog(
+            serverId,
+            serverName,
+            "stderr",
+            `Failed to connect within ${CONNECT_TIMEOUT_MS}ms or during initialize: ${msg}\n`,
+          );
+          try {
+            await transport.close();
+          } catch {
+            // best-effort cleanup
+          }
+          throw connectError;
+        }
+
+        // Connect succeeded — attach child-process listeners for ongoing log capture.
         if (transportAny._process || transportAny.process) {
           const childProcess = transportAny._process || transportAny.process;
 
-          // Capture stdout if available (transport reads this for JSON-RPC; we attach an extra listener to get a copy)
+          // Capture stdout (transport reads this for JSON-RPC; an extra 'data' listener
+          // is non-consuming because Node Readable supports multiple listeners).
           if (childProcess.stdout) {
             childProcess.stdout.on("data", (data: Buffer) => {
               const content = data.toString();
@@ -158,7 +181,6 @@ export class MCPClient {
             });
           }
 
-          // Handle process errors
           childProcess.on("error", (error: Error) => {
             const errorMessage = error.message || String(error);
             consoleService.addLog(
@@ -169,7 +191,6 @@ export class MCPClient {
             );
           });
 
-          // Handle process exit
           childProcess.on(
             "exit",
             (code: number | null, signal: string | null) => {
@@ -191,7 +212,6 @@ export class MCPClient {
             },
           );
         } else {
-          // If we can't access the child process, at least log the connection
           consoleService.addLog(
             serverId,
             serverName,
