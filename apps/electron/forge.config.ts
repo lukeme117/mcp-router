@@ -11,6 +11,7 @@ import { rendererConfig } from "./webpack.renderer.config";
 import { MakerDMG } from "@electron-forge/maker-dmg";
 import { MakerDeb } from "@electron-forge/maker-deb";
 import * as path from "path";
+import { execFileSync } from "child_process";
 import { postMake } from "./forge-hooks";
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -25,12 +26,44 @@ const hasNotarizeCreds = !!(
   process.env.APPLE_API_ISSUER
 );
 
+/**
+ * Determine the architecture native modules and the packaged app should target.
+ *
+ * Resolution order:
+ *   1. `npm_config_target_arch` — explicit override (cross-arch CI builds).
+ *   2. `sysctl.proc_translated` on macOS — detects when an x86_64 Node binary
+ *      runs under Rosetta on an Apple Silicon machine. In that case
+ *      `process.arch` reports "x64" but Electron downloads an arm64 binary,
+ *      so natives must be built for arm64 to be loadable by the host Electron.
+ *   3. `process.arch` — normal case.
+ */
+function detectTargetArch(): NodeJS.Architecture {
+  if (process.env.npm_config_target_arch) {
+    return process.env.npm_config_target_arch as NodeJS.Architecture;
+  }
+  if (process.platform === "darwin" && process.arch === "x64") {
+    try {
+      const translated = execFileSync(
+        "sysctl",
+        ["-n", "sysctl.proc_translated"],
+        { encoding: "utf8" },
+      ).trim();
+      if (translated === "1") return "arm64";
+    } catch {
+      // sysctl missing or unavailable — fall through.
+    }
+  }
+  return process.arch;
+}
+
+const targetArch = detectTargetArch();
+
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
     icon: "./public/images/icon/icon",
-    // Support both Intel and Apple Silicon architectures - use target arch from env
-    arch: (process.env.npm_config_target_arch as any) || process.arch,
+    // Support both Intel and Apple Silicon architectures (see detectTargetArch).
+    arch: targetArch,
     // Set executable name for Linux
     executableName: process.platform === "linux" ? "mcp-router" : undefined,
     // Only sign/notarize on macOS when credentials are available (CI-safe)
@@ -49,7 +82,7 @@ const config: ForgeConfig = {
   },
   rebuildConfig: {
     // Force rebuild native modules for the target architecture
-    arch: (process.env.npm_config_target_arch as any) || process.arch,
+    arch: targetArch,
   },
   makers: [
     new MakerSquirrel({
